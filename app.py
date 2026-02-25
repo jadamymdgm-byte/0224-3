@@ -3,6 +3,7 @@ import time
 import random
 import pandas as pd
 from datetime import datetime, date
+import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Logistics AI Hub", page_icon="📦", layout="wide")
@@ -36,32 +37,24 @@ if 'current_tasks' not in st.session_state:
 def parse_logistics_excel(file):
     """添付された特定のExcelフォーマットを解析する"""
     try:
-        # 全シート読み込み
         xl = pd.ExcelFile(file)
         new_reports = []
         
         for sheet_name in xl.sheet_names:
-            # 「〇日」という名前のシートのみ対象（または全シート）
             df = xl.parse(sheet_name, header=None)
             
-            # 安全対策：行や列が極端に少ないシート（空シートなど）はスキップ
             if len(df) < 4 or df.shape[1] < 7:
                 continue
             
             # 1. 基本情報の抽出
-            # 日付: 4行目(インデックス3) B列(1)
             raw_date = df.iloc[3, 1]
             report_date = str(raw_date.date()) if hasattr(raw_date, 'date') else str(raw_date)
-            
-            # 天候: 4行目 F列(5)
             weather = str(df.iloc[3, 5]) if not pd.isna(df.iloc[3, 5]) else "晴"
-            
-            # 報告者: 4行目 G列(6)
             reporter = str(df.iloc[3, 6]) if not pd.isna(df.iloc[3, 6]) else "不明"
             
-            # 2. 業務内容の抽出 (6行目〜28行目付近のD列)
+            # 2. 業務内容の抽出
             tasks = []
-            max_task_row = min(28, len(df)) # 安全対策：実際の行数に合わせてストップ
+            max_task_row = min(28, len(df))
             for i in range(5, max_task_row):
                 content = df.iloc[i, 3] if df.shape[1] > 3 else ""
                 category = df.iloc[i, 13] if df.shape[1] > 13 else "現場"
@@ -72,17 +65,16 @@ def parse_logistics_excel(file):
                         "content": str(content)
                     })
 
-            # 3. 特記事項の抽出 (34行目付近)
+            # 3. 特記事項の抽出
             note = ""
-            max_note_row = min(40, len(df)) # ファイルの行数か40の小さい方までにする
-            if len(df) > 33: # そもそも34行目以降が存在する場合のみ実行
+            max_note_row = min(40, len(df))
+            if len(df) > 33:
                 for i in range(33, max_note_row): 
                     val = df.iloc[i, 3] if df.shape[1] > 3 else ""
                     if pd.notna(val):
                         note += str(val) + "\n"
 
-            # 4. 実績数値（特記事項内のテキストから抽出を試みるモックロジック）
-            import re
+            # 4. 実績数値
             case_match = re.search(r'(\d+)ケース', note)
             item_match = re.search(r'(\d+)件', note)
             
@@ -115,19 +107,63 @@ def select_staff(staff):
 def add_task():
     st.session_state.current_tasks.append({"sh": "09", "sm": "00", "category": "現場", "content": ""})
 
+# --- 実データに基づいた分析ロジック ---
 def generate_mock_analysis(reports):
     if not reports: return None
+    
+    # 全タスクを集計
+    all_tasks = [t for r in reports for t in r["tasks"]]
+    total_tasks = len(all_tasks) if all_tasks else 1
+    
+    counts = {cat: 0 for cat in CATEGORIES}
+    for t in all_tasks:
+        cat = t.get("category", "その他")
+        if cat in counts:
+            counts[cat] += 1
+    
+    # 稼働比率の計算
+    field_ratio = int((counts["現場"] / total_tasks) * 100)
+    desk_ratio = int((counts["デスクワーク"] / total_tasks) * 100)
+    meeting_ratio = int((counts["会議"] / total_tasks) * 100)
+    
+    # キーワード検知によるアラート生成
+    alerts = []
+    combined_notes = " ".join([r["note"] for r in reports]).lower()
+    
+    if any(k in combined_notes for k in ["エラー", "トラブル", "ミス", "不具合"]):
+        alerts.append({
+            "id": 101, "type": "system", 
+            "text": "【システム/品質】特記事項から「エラー」や「ミス」に関するキーワードが検出されました。再発防止策の確認が必要です。",
+            "comment": "", "feedback": None
+        })
+    
+    if any(k in combined_notes for k in ["遅延", "残業", "補充", "圧迫", "追い付かない"]):
+        alerts.append({
+            "id": 102, "type": "operation", 
+            "text": "【現場負荷】作業遅延や現場の圧迫を示唆する報告があります。人員配置や作業フローの調整を推奨します。",
+            "comment": "", "feedback": None
+        })
+
+    if not alerts:
+        alerts.append({
+            "id": 100, "type": "info", "text": "現在、特記すべき異常キーワードは見当たりません。現場は概ね順調に推移しています。",
+            "comment": "", "feedback": None
+        })
+
     return {
-        "alerts": [
-            {"id": 101, "type": "system", "text": "【システム】さいまるV4への移行に伴う操作の戸惑いが散見されます。操作マニュアルの再周知が必要です。", "comment": "", "feedback": None},
-            {"id": 102, "type": "operation", "text": "【現場負荷】スギ薬局向けの緊急補充（61件/364ケース等）が多発しており、ステージングエリアが圧迫されています。", "comment": "", "feedback": None}
-        ],
+        "alerts": alerts,
         "connections": [
-            {"id": 201, "title": "改善事例の水平展開", "text": "山田さんが改善発表大会で提示した「生成AIによる可視化」を他センターへも展開する準備を推奨します。", "comment": "", "feedback": None}
+            {
+                "id": 201, "title": "データ傾向", 
+                "text": f"計{len(reports)}件の日報から、現場のリアルな課題を抽出しました。{field_ratio}%が現場作業に充てられています。",
+                "comment": "", "feedback": None
+            }
         ],
         "stats": {
-            "fieldWorkRatio": "70%", "deskWorkRatio": "25%", "meetingRatio": "5%",
-            "trendComment": f"直近{len(reports)}件のデータを分析。改善活動への意欲が高く、現場の細かな課題（SSエラー等）も即時記録されています。"
+            "fieldWorkRatio": f"{field_ratio}%", 
+            "deskWorkRatio": f"{desk_ratio}%", 
+            "meetingRatio": f"{meeting_ratio}%",
+            "trendComment": f"分析対象: {len(reports)}件の日報。現場比率は{field_ratio}%です。{'現場作業が中心の稼働' if field_ratio > 50 else '比較的デスク業務や会議の多い稼動'}となっています。"
         }
     }
 
@@ -146,7 +182,6 @@ def render_navigation():
     with cols[4]:
         if st.button("一覧ダッシュボード", use_container_width=True): change_view('dashboard'); st.rerun()
     
-    # サイドバーにExcelアップローダーを配置
     with st.sidebar:
         st.markdown("### 📥 Excel一括取込")
         st.caption("指定の日報フォーマット(xlsx)を選択してください")
